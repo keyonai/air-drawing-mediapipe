@@ -1,6 +1,8 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import urllib.request
+import os
 
 # ─────────────────────────────────────────────
 # GIRLY COLOR PALETTE (BGR format for OpenCV)
@@ -24,23 +26,62 @@ ERASER_SIZE     = 40     # thickness of eraser
 TIP_SMOOTHING   = 0.5    # smoothing factor for fingertip position (0=none, 1=max)
 
 # ─────────────────────────────────────────────
-# MEDIAPIPE HAND SETUP
+# HAND SKELETON CONNECTIONS (21 landmarks)
 # ─────────────────────────────────────────────
-# MediaPipe Hands detects 21 landmarks on each hand
-# Landmark indices we use:
-#   4  = thumb tip
-#   8  = index finger tip
-#   12 = middle finger tip
-#   16 = ring finger tip
-#   20 = pinky tip
-#   6  = index finger pip (middle joint) — used to check if finger is up
-mp_hands = mp.solutions.hands
-mp_draw  = mp.solutions.drawing_utils
-hands    = mp_hands.Hands(
-    max_num_hands=1,          # track one hand only
-    min_detection_confidence=0.8,
+HAND_CONNECTIONS = [
+    (0, 1),  (1, 2),  (2, 3),  (3, 4),          # thumb
+    (0, 5),  (5, 6),  (6, 7),  (7, 8),           # index finger
+    (5, 9),  (9, 10), (10, 11),(11, 12),          # middle finger
+    (9, 13), (13, 14),(14, 15),(15, 16),           # ring finger
+    (13, 17),(0, 17), (17, 18),(18, 19),(19, 20), # pinky
+]
+
+# ─────────────────────────────────────────────
+# DOWNLOAD MEDIAPIPE HAND LANDMARKER MODEL
+# ─────────────────────────────────────────────
+# The new Tasks API needs a .task model file downloaded once
+MODEL_PATH = "hand_landmarker.task"
+MODEL_URL  = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+)
+
+if not os.path.exists(MODEL_PATH):
+    print("Downloading hand landmarker model (~8 MB)...")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("Model downloaded.")
+
+# ─────────────────────────────────────────────
+# MEDIAPIPE HAND LANDMARKER SETUP (new Tasks API)
+# ─────────────────────────────────────────────
+# MediaPipe 0.10+ replaced mp.solutions.hands with the Tasks API.
+# We use IMAGE mode (synchronous, one frame at a time — simple for webcam loops).
+options = mp.tasks.vision.HandLandmarkerOptions(
+    base_options=mp.tasks.BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=mp.tasks.vision.RunningMode.IMAGE,
+    num_hands=1,
+    min_hand_detection_confidence=0.8,
+    min_hand_presence_confidence=0.8,
     min_tracking_confidence=0.8,
 )
+landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
+
+
+def draw_hand_landmarks(frame, landmarks, w, h):
+    """
+    Manually draw the hand skeleton on the frame.
+    Each landmark has .x and .y in normalized 0-1 coords.
+    """
+    # Convert all landmarks to pixel coordinates
+    points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+
+    # Draw bone connections
+    for start, end in HAND_CONNECTIONS:
+        cv2.line(frame, points[start], points[end], (200, 200, 200), 1)
+
+    # Draw landmark dots
+    for pt in points:
+        cv2.circle(frame, pt, 3, (255, 255, 255), -1)
 
 
 def fingers_up(landmarks, w, h):
@@ -118,7 +159,6 @@ def main():
         return
 
     # ── Canvas: transparent overlay where drawing is stored ──
-    # We keep a separate canvas and blend it onto the webcam frame each tick
     ret, frame = cap.read()
     canvas = np.zeros_like(frame)   # black canvas, same size as webcam
 
@@ -126,17 +166,16 @@ def main():
     prev_x, prev_y    = 0, 0 # previous fingertip position for line drawing
     smoothed_x        = 0    # smoothed fingertip x position
     smoothed_y        = 0    # smoothed fingertip y position
+    eraser_mode       = False
 
     print("Controls:")
-    print("  ✦ Point (index finger only) → draw")
-    print("  ✦ Fist (all fingers down)   → stop drawing / lift pen")
-    print("  ✦ Peace sign (index + middle up) → eraser mode")
-    print("  ✦ Hover over color swatches at top to switch color")
-    print("  ✦ Press 'c' to clear canvas")
-    print("  ✦ Press 'q' to quit")
-    print("  ✦ Press 's' to save drawing")
-
-    eraser_mode = False
+    print("  Point (index finger only) -> draw")
+    print("  Fist (all fingers down)   -> stop drawing / lift pen")
+    print("  Peace sign (index + middle up) -> eraser mode")
+    print("  Hover over color swatches at top to switch color")
+    print("  Press 'c' to clear canvas")
+    print("  Press 'q' to quit")
+    print("  Press 's' to save drawing")
 
     while True:
         ret, frame = cap.read()
@@ -148,88 +187,88 @@ def main():
         h, w  = frame.shape[:2]
 
         # ── Run MediaPipe hand detection ──
-        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb)
+        # New Tasks API: wrap the frame in mp.Image, then call detect()
+        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result   = landmarker.detect(mp_image)
 
-        gesture = "none"   # "drawing", "erasing", "idle", or "none"
+        gesture = "none"
 
-        if result.multi_hand_landmarks:
-            for hand_landmarks in result.multi_hand_landmarks:
+        if result.hand_landmarks:
+            # result.hand_landmarks is a list of hands; take the first one
+            landmarks = result.hand_landmarks[0]
 
-                # Draw the hand skeleton (landmarks + connections)
-                mp_draw.draw_landmarks(frame, hand_landmarks,
-                                       mp_hands.HAND_CONNECTIONS)
+            # Draw the hand skeleton manually (no mp.solutions.drawing_utils in new API)
+            draw_hand_landmarks(frame, landmarks, w, h)
 
-                landmarks = hand_landmarks.landmark
-                up = fingers_up(landmarks, w, h)
-                # up = [thumb, index, middle, ring, pinky]
+            up = fingers_up(landmarks, w, h)
+            # up = [thumb, index, middle, ring, pinky]
 
-                # Get index fingertip position in pixel coordinates
-                raw_x = int(landmarks[8].x * w)
-                raw_y = int(landmarks[8].y * h)
+            # Get index fingertip position in pixel coordinates (landmark 8)
+            raw_x = int(landmarks[8].x * w)
+            raw_y = int(landmarks[8].y * h)
 
-                # Smooth the fingertip position to reduce jitter
-                smoothed_x = int(smoothed_x * TIP_SMOOTHING + raw_x * (1 - TIP_SMOOTHING))
-                smoothed_y = int(smoothed_y * TIP_SMOOTHING + raw_y * (1 - TIP_SMOOTHING))
+            # Smooth the fingertip position to reduce jitter
+            smoothed_x = int(smoothed_x * TIP_SMOOTHING + raw_x * (1 - TIP_SMOOTHING))
+            smoothed_y = int(smoothed_y * TIP_SMOOTHING + raw_y * (1 - TIP_SMOOTHING))
 
-                # ── Detect gesture ──
-                index_up  = up[1]
-                middle_up = up[2]
-                ring_up   = up[3]
-                pinky_up  = up[4]
+            # ── Detect gesture ──
+            index_up  = up[1]
+            middle_up = up[2]
+            ring_up   = up[3]
+            pinky_up  = up[4]
 
-                all_down = not index_up and not middle_up and not ring_up and not pinky_up
+            all_down = not index_up and not middle_up and not ring_up and not pinky_up
 
-                if index_up and middle_up and not ring_up and not pinky_up:
-                    # ✌️ Peace sign = ERASER
-                    gesture = "erasing"
-                    eraser_mode = True
-                elif index_up and not middle_up and not ring_up and not pinky_up:
-                    # ☝️ One finger = DRAW
-                    gesture = "drawing"
-                    eraser_mode = False
+            if index_up and middle_up and not ring_up and not pinky_up:
+                # Peace sign = ERASER
+                gesture     = "erasing"
+                eraser_mode = True
+            elif index_up and not middle_up and not ring_up and not pinky_up:
+                # One finger = DRAW
+                gesture     = "drawing"
+                eraser_mode = False
 
-                    # Check if hovering over color palette
-                    if smoothed_y < 70:
-                        current_color_idx = check_color_selection(
-                            smoothed_x, smoothed_y, current_color_idx)
-                        prev_x, prev_y = 0, 0  # reset so we don't draw a line
-                    else:
-                        # Draw line from previous point to current point
-                        if prev_x == 0 and prev_y == 0:
-                            prev_x, prev_y = smoothed_x, smoothed_y
-
-                        cv2.line(canvas,
-                                 (prev_x, prev_y),
-                                 (smoothed_x, smoothed_y),
-                                 COLOR_VALUES[current_color_idx],
-                                 BRUSH_SIZE)
+                # Check if hovering over color palette
+                if smoothed_y < 70:
+                    current_color_idx = check_color_selection(
+                        smoothed_x, smoothed_y, current_color_idx)
+                    prev_x, prev_y = 0, 0  # reset so we don't draw a line
+                else:
+                    # Draw line from previous point to current point
+                    if prev_x == 0 and prev_y == 0:
                         prev_x, prev_y = smoothed_x, smoothed_y
 
-                elif all_down:
-                    # ✊ Fist = LIFT PEN (stop drawing)
-                    gesture = "idle"
-                    prev_x, prev_y = 0, 0
+                    cv2.line(canvas,
+                             (prev_x, prev_y),
+                             (smoothed_x, smoothed_y),
+                             COLOR_VALUES[current_color_idx],
+                             BRUSH_SIZE)
+                    prev_x, prev_y = smoothed_x, smoothed_y
 
-                else:
-                    prev_x, prev_y = 0, 0
+            elif all_down:
+                # Fist = LIFT PEN (stop drawing)
+                gesture        = "idle"
+                prev_x, prev_y = 0, 0
 
-                # ── Erase mode ──
-                if eraser_mode and gesture == "erasing":
-                    cv2.circle(canvas, (smoothed_x, smoothed_y),
-                               ERASER_SIZE, (0, 0, 0), -1)
-                    prev_x, prev_y = 0, 0
+            else:
+                prev_x, prev_y = 0, 0
 
-                # ── Draw fingertip dot ──
-                dot_color = (255, 255, 255) if eraser_mode else COLOR_VALUES[current_color_idx]
-                cv2.circle(frame, (smoothed_x, smoothed_y), 8, dot_color, -1)
+            # ── Erase mode ──
+            if eraser_mode and gesture == "erasing":
+                cv2.circle(canvas, (smoothed_x, smoothed_y),
+                           ERASER_SIZE, (0, 0, 0), -1)
+                prev_x, prev_y = 0, 0
+
+            # ── Draw fingertip dot ──
+            dot_color = (255, 255, 255) if eraser_mode else COLOR_VALUES[current_color_idx]
+            cv2.circle(frame, (smoothed_x, smoothed_y), 8, dot_color, -1)
 
         else:
             # No hand detected — reset prev position
             prev_x, prev_y = 0, 0
 
         # ── Blend canvas onto webcam frame ──
-        # Where canvas is not black (drawn pixels), overlay them on the frame
         canvas_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
         _, mask = cv2.threshold(canvas_gray, 1, 255, cv2.THRESH_BINARY)
         frame[mask > 0] = canvas[mask > 0]
@@ -258,17 +297,23 @@ def main():
         cv2.imshow("Air Drawing  |  q=quit  c=clear  s=save", frame)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+
+        # Quit: press Q or Esc, or click the window X button
+        if key in (ord('q'), 27):
             break
-        elif key == ord('c'):
-            # Clear the canvas
+        if cv2.getWindowProperty(
+                "Air Drawing  |  q=quit  c=clear  s=save",
+                cv2.WND_PROP_VISIBLE) < 1:
+            break
+
+        if key == ord('c'):
             canvas = np.zeros_like(frame)
             print("Canvas cleared!")
         elif key == ord('s'):
-            # Save the drawing
             cv2.imwrite("drawing.png", canvas)
             print("Saved drawing to drawing.png")
 
+    landmarker.close()
     cap.release()
     cv2.destroyAllWindows()
 
